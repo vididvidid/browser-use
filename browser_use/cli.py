@@ -38,9 +38,13 @@ try:
 	import click
 	from textual import events
 	from textual.app import App, ComposeResult
+	from textual.screen import Screen
 	from textual.binding import Binding
 	from textual.containers import Container, HorizontalGroup, VerticalScroll
-	from textual.widgets import Footer, Header, Input, Label, Link, RichLog, Static
+	from textual.widgets import Footer, Header, Input, Label, Link, RichLog, Static, DataTable
+	from textual.scroll_view import ScrollView
+	from rich.text import Text
+	from rich.table import Table
 except ImportError:
 	print('⚠️ CLI addon is not installed. Please install it with: `pip install "browser-use[cli]"` and try again.')
 	sys.exit(1)
@@ -260,20 +264,231 @@ def get_llm(config: dict[str, Any]):
 		sys.exit(1)
 
 
-class RichLogHandler(logging.Handler):
-	"""Custom logging handler that redirects logs to a RichLog widget."""
+class ThreeColumnLogViewer(Static):
+	"""Three-column log viewer with vim-style navigation for the message column."""
+	
+	BINDINGS = [
+		Binding('j', 'scroll_down', 'Scroll Down', show=False),
+		Binding('k', 'scroll_up', 'Scroll Up', show=False),
+		Binding('g', 'scroll_top', 'Go to Top', show=False),
+		Binding('G', 'scroll_bottom', 'Go to Bottom', show=False),
+		Binding('/', 'search', 'Search', show=False),
+		Binding('n', 'next_match', 'Next Match', show=False),
+		Binding('N', 'prev_match', 'Previous Match', show=False),
+	]
+	
+	DEFAULT_CSS = """
+	ThreeColumnLogViewer {
+		width: 100%;
+		height: 100%;
+		overflow-y: auto;
+		overflow-x: hidden;
+	}
+	"""
+	
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		self.log_lines = []  # Store all log lines as tuples: (level, location, message)
+		self.search_query = ""
+		self.search_matches = []
+		self.current_match_index = -1
+		self.vim_mode_active = False
+		self.can_focus = True
+		self._scroll_target = None
+	
+	def on_focus(self):
+		"""Activate vim mode when focused."""
+		self.vim_mode_active = True
+		self.border_title = "Log Viewer (VIM MODE)"
+	
+	def on_blur(self):
+		"""Deactivate vim mode when focus is lost."""
+		self.vim_mode_active = False
+		self.border_title = None
+	
+	def add_log(self, level: str, location: str, message: str):
+		"""Add a log entry to the viewer."""
+		self.log_lines.append((level, location, message))
+		self.refresh_display()
+		# Auto-scroll to bottom on new log
+		self.call_after_refresh(self.scroll_end, animate=False)
+	
+	def refresh_display(self):
+		"""Refresh the display with current log lines."""
+		table = Table.grid(padding=(0, 1))
+		table.add_column(width=12, no_wrap=True)  # Level column
+		table.add_column(width=30, no_wrap=True)  # Location column  
+		table.add_column()  # Message column (flexible width)
+		
+		for i, (level, location, message) in enumerate(self.log_lines):
+			# Color-code the level
+			level_color = self._get_level_color(level)
+			level_text = Text(level.ljust(10), style=level_color)
+			location_text = Text(location[:28].ljust(28), style="cyan")
+			
+			# Highlight search matches
+			if self.search_query and self.search_query.lower() in message.lower():
+				message_text = self._highlight_search(message)
+			else:
+				message_text = Text(message)
+			
+			table.add_row(level_text, location_text, message_text)
+		
+		# Update the widget content
+		self.update(table)
+	
+	def _get_level_color(self, level: str) -> str:
+		"""Get color for log level."""
+		level_colors = {
+			'DEBUG': 'blue',
+			'INFO': 'green',
+			'WARNING': 'yellow',
+			'ERROR': 'red',
+			'CRITICAL': 'bold red',
+			'RESULT': 'magenta',
+		}
+		return level_colors.get(level.upper(), 'white')
+	
+	def _highlight_search(self, text: str) -> Text:
+		"""Highlight search query in text."""
+		result = Text()
+		lower_text = text.lower()
+		lower_query = self.search_query.lower()
+		last_index = 0
+		
+		while True:
+			index = lower_text.find(lower_query, last_index)
+			if index == -1:
+				result.append(text[last_index:])
+				break
+			result.append(text[last_index:index])
+			result.append(text[index:index + len(self.search_query)], style="black on yellow")
+			last_index = index + len(self.search_query)
+		
+		return result
+	
+	def action_scroll_down(self):
+		"""Scroll down by one line (vim j)."""
+		if self.vim_mode_active:
+			self.scroll_relative(y=1, animate=False)
+	
+	def action_scroll_up(self):
+		"""Scroll up by one line (vim k)."""
+		if self.vim_mode_active:
+			self.scroll_relative(y=-1, animate=False)
+	
+	def action_scroll_top(self):
+		"""Scroll to top (vim gg)."""
+		if self.vim_mode_active:
+			self.scroll_home(animate=False)
+	
+	def action_scroll_bottom(self):
+		"""Scroll to bottom (vim G)."""
+		if self.vim_mode_active:
+			self.scroll_end(animate=False)
+	
+	def action_search(self):
+		"""Open search prompt (vim /)."""
+		if self.vim_mode_active:
+			self.app.push_screen(SearchScreen(self))
+	
+	def perform_search(self, query: str):
+		"""Perform search with given query."""
+		self.search_query = query
+		self.search_matches = []
+		
+		for i, (level, location, message) in enumerate(self.log_lines):
+			if query.lower() in message.lower():
+				self.search_matches.append(i)
+		
+		if self.search_matches:
+			self.current_match_index = 0
+			self._jump_to_match(self.current_match_index)
+		
+		self.refresh_display()
+	
+	def action_next_match(self):
+		"""Jump to next search match (vim n)."""
+		if self.vim_mode_active and self.search_matches:
+			self.current_match_index = (self.current_match_index + 1) % len(self.search_matches)
+			self._jump_to_match(self.current_match_index)
+	
+	def action_prev_match(self):
+		"""Jump to previous search match (vim N)."""
+		if self.vim_mode_active and self.search_matches:
+			self.current_match_index = (self.current_match_index - 1) % len(self.search_matches)
+			self._jump_to_match(self.current_match_index)
+	
+	def _jump_to_match(self, match_index: int):
+		"""Jump to a specific search match."""
+		if 0 <= match_index < len(self.search_matches):
+			line_number = self.search_matches[match_index]
+			# Calculate approximate scroll position (assuming ~2 units per line)
+			target_y = line_number * 2
+			self.scroll_to(y=target_y, animate=False)
 
-	def __init__(self, rich_log: RichLog):
+class SearchScreen(Screen):
+	"""Modal screen for search input."""
+	
+	BINDINGS = [
+		Binding('escape', 'dismiss', 'Cancel', show=False),
+	]
+	
+	def __init__(self, log_viewer: ThreeColumnLogViewer):
 		super().__init__()
-		self.rich_log = rich_log
+		self.log_viewer = log_viewer
+	
+	def compose(self) -> ComposeResult:
+		yield Container(
+			Label("Search:", id="search-label"),
+			Input(placeholder="Enter search query...", id="search-input"),
+			id="search-container"
+		)
+	
+	def on_mount(self):
+		self.query_one("#search-input", Input).focus()
+	
+	def on_input_submitted(self, event: Input.Submitted):
+		if event.input.id == "search-input":
+			query = event.input.value
+			if query:
+				self.log_viewer.perform_search(query)
+			self.dismiss()
+	
+	def action_dismiss(self):
+		self.dismiss()
 
+class ThreeColumnLogHandler(logging.Handler):
+	"""Custom logging handler that redirects logs to ThreeColumnLogViewer widget."""
+	
+	def __init__(self, log_viewer: ThreeColumnLogViewer):
+		super().__init__()
+		self.log_viewer = log_viewer
+	
 	def emit(self, record):
 		try:
-			msg = self.format(record)
-			self.rich_log.write(msg)
-		except Exception:
+			# Extract level, location (logger name), and message
+			level = record.levelname
+			location = record.name
+			
+			# Clean up location name - shorten if it's browser_use.*
+			if location.startswith('browser_use.'):
+				parts = location.split('.')
+				if len(parts) > 2:
+					location = '.'.join(parts[-2:])  # Keep last 2 parts
+				else:
+					location = parts[-1]  # Keep last part only
+			
+			# Get the actual message - don't use formatted message
+			message = record.getMessage()
+			
+			# Add to the viewer
+			self.log_viewer.add_log(level, location, message)
+		except Exception as e:
+			# Fallback - print to stderr so we can debug
+			import sys
+			print(f"Error in log handler: {e}", file=sys.stderr)
 			self.handleError(record)
-
 
 class BrowserUseApp(App):
 	"""Browser-use TUI application."""
@@ -348,6 +563,19 @@ class BrowserUseApp(App):
 		border: solid $primary;
 		padding: 0;
 		margin: 0 1 0 0;
+	}
+	
+	ThreeColumnLogViewer {
+		width: 100%;
+		height: 100%;
+		border: solid $primary;
+		background: $surface;
+		padding: 1;
+		scrollbar-gutter: stable;
+	}
+	
+	ThreeColumnLogViewer:focus {
+		border: solid $accent;
 	}
 	
 	#events-column {
@@ -450,6 +678,28 @@ class BrowserUseApp(App):
 	#task-input {
 		width: 100%;
 	}
+	
+	#search-container {
+		width: 60;
+		height: auto;
+		border: solid $accent;
+		background: $surface;
+		padding: 1;
+		align: center middle;
+	}
+	
+	#search-label {
+		color: $accent;
+		padding-bottom: 1;
+	}
+	
+	#search-input {
+		width: 100%;
+	}
+	
+	SearchScreen {
+		align: center middle;
+	}
 	"""
 
 	BINDINGS = [
@@ -479,40 +729,39 @@ class BrowserUseApp(App):
 		self._info_panel_timer = None
 
 	def setup_richlog_logging(self) -> None:
-		"""Set up logging to redirect to RichLog widget instead of stdout."""
+		"""Set up logging to redirect to ThreeColumnLogViewer widget instead of stdout."""
 		# Try to add RESULT level if it doesn't exist
 		try:
 			addLoggingLevel('RESULT', 35)
 		except AttributeError:
 			pass  # Level already exists, which is fine
-
-		# Get the main output RichLog widget
-		rich_log = self.query_one('#main-output-log', RichLog)
-
+		
+		# Get the main output ThreeColumnLogViewer widget
+		log_viewer = self.query_one('#main-output-log', ThreeColumnLogViewer)
+		
 		# Create and set up the custom handler
-		log_handler = RichLogHandler(rich_log)
+		log_handler = ThreeColumnLogHandler(log_viewer)
 		log_type = os.getenv('BROWSER_USE_LOGGING_LEVEL', 'result').lower()
-
-		class BrowserUseFormatter(logging.Formatter):
-			def format(self, record):
-				# if isinstance(record.name, str) and record.name.startswith('browser_use.'):
-				# 	record.name = record.name.split('.')[-2]
-				return super().format(record)
-
-		# Set up the formatter based on log type
+		
+		# Simple formatter - we handle formatting in the handler
+		simple_formatter = logging.Formatter('%(message)s')
+		log_handler.setFormatter(simple_formatter)
+		
+		# Set handler level
 		if log_type == 'result':
 			log_handler.setLevel('RESULT')
-			log_handler.setFormatter(BrowserUseFormatter('%(message)s'))
+		elif log_type == 'debug':
+			log_handler.setLevel(logging.DEBUG)
 		else:
-			log_handler.setFormatter(BrowserUseFormatter('%(levelname)-8s [%(name)s] %(message)s'))
-
-		# Configure root logger - Replace ALL handlers, not just stdout handlers
+			log_handler.setLevel(logging.INFO)
+		
+		# Configure root logger - Replace ALL handlers
 		root = logging.getLogger()
-
+		
 		# Clear all existing handlers to prevent output to stdout/stderr
 		root.handlers = []
 		root.addHandler(log_handler)
-
+		
 		# Set log level based on environment variable
 		if log_type == 'result':
 			root.setLevel('RESULT')
@@ -520,21 +769,20 @@ class BrowserUseApp(App):
 			root.setLevel(logging.DEBUG)
 		else:
 			root.setLevel(logging.INFO)
-
+		
 		# Configure browser_use logger and all its sub-loggers
 		browser_use_logger = logging.getLogger('browser_use')
-		browser_use_logger.propagate = False  # Don't propagate to root logger
-		browser_use_logger.handlers = [log_handler]  # Replace any existing handlers
+		browser_use_logger.propagate = False
+		browser_use_logger.handlers = [log_handler]
 		browser_use_logger.setLevel(root.level)
-
+		
 		# Also ensure agent loggers go to the main output
-		# Use a wildcard pattern to catch all agent-related loggers
 		for logger_name in ['browser_use.Agent', 'browser_use.controller', 'browser_use.agent', 'browser_use.agent.service']:
 			agent_logger = logging.getLogger(logger_name)
 			agent_logger.propagate = False
 			agent_logger.handlers = [log_handler]
 			agent_logger.setLevel(root.level)
-
+		
 		# Also catch any dynamically created agent loggers with task IDs
 		for name, logger in logging.Logger.manager.loggerDict.items():
 			if isinstance(name, str) and 'browser_use.Agent' in name:
@@ -542,7 +790,7 @@ class BrowserUseApp(App):
 					logger.propagate = False
 					logger.handlers = [log_handler]
 					logger.setLevel(root.level)
-
+		
 		# Silence third-party loggers but keep them using our handler
 		for logger_name in [
 			'WDM',
@@ -565,8 +813,8 @@ class BrowserUseApp(App):
 			third_party = logging.getLogger(logger_name)
 			third_party.setLevel(logging.ERROR)
 			third_party.propagate = False
-			third_party.handlers = [log_handler]  # Use our handler to prevent stdout/stderr leakage
-
+			third_party.handlers = [log_handler]
+	
 	def on_mount(self) -> None:
 		"""Set up components when app is mounted."""
 		# We'll use a file logger since stdout is now controlled by Textual
@@ -628,6 +876,10 @@ class BrowserUseApp(App):
 		)
 
 		logger.debug('on_mount() completed successfully')
+		# Test that logging to widget works
+		logger.info('✅ Logging to three-column viewer is working!')
+		logger.debug('Debug message test')
+		logger.warning('Warning message test')
 
 	def on_input_key_up(self, event: events.Key) -> None:
 		"""Handle up arrow key in the input field."""
@@ -861,8 +1113,9 @@ class BrowserUseApp(App):
 		self.hide_intro_panels()
 
 		# Clear the main output log to start fresh
-		rich_log = self.query_one('#main-output-log', RichLog)
-		rich_log.clear()
+		log_viewer = self.query_one('#main-output-log', ThreeColumnLogViewer)
+		log_viewer.log_lines = []
+		log_viewer.refresh_display()
 
 		if self.agent is None:
 			if not self.llm:
@@ -1062,8 +1315,8 @@ class BrowserUseApp(App):
 			# Three-column container (hidden by default)
 			with Container(id='three-column-container'):
 				# Column 1: Main output
-				with VerticalScroll(id='main-output-column'):
-					yield RichLog(highlight=True, markup=True, id='main-output-log', wrap=True, auto_scroll=True)
+				yield ThreeColumnLogViewer(id='main-output-log')
+					# yield RichLog(highlight=True, markup=True, id='main-output-log', wrap=True, auto_scroll=True)
 
 				# Column 2: Event bus events
 				with VerticalScroll(id='events-column'):
